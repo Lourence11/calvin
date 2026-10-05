@@ -1,0 +1,821 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from ui_utils import set_premium_style
+
+import streamlit as st
+import pandas as pd
+import os
+import shutil
+import tempfile
+from datetime import datetime
+from io import BytesIO
+import msoffcrypto
+
+# Set page configuration
+st.set_page_config(page_title="ProdE Automation", page_icon=None, layout="wide")
+
+# Apply consistent premium design
+set_premium_style()
+
+
+# Check for win32com availability
+try:
+    import win32com.client
+    import pythoncom
+    WIN32COM_AVAILABLE = True
+except ImportError:
+    WIN32COM_AVAILABLE = False
+    st.warning(" pywin32 is not installed. Excel COM automation will not work. Install with: pip install pywin32")
+
+# --- FILE PATH CONFIGURATION ---
+TEMPLATE_PATH = r"C:\Users\SPM\Downloads\BPI\Template\MADPL TEMPLATE v3 ETO MUNA v1.xlsm"
+SAVE_PATH = r"C:\Users\SPM\Downloads\BPI\Productivity Report_ Every Monday\DRR"
+AUTOMATED_PATH = r"C:\Users\SPM\Downloads\BPI\Productivity Report_ Every Monday\Automated"
+
+# Create folders if they don't exist
+for path in [SAVE_PATH, AUTOMATED_PATH]:
+    if not os.path.exists(path):
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+
+def process_template(df_cleaned, tmpl_path, output_path, password=""):
+    """Copy template and use Excel COM to write data and replicate formulas."""
+    if not WIN32COM_AVAILABLE:
+        st.error("pywin32 is required but not installed.")
+        return False
+    
+    import win32com.client
+    import pythoncom
+    import time
+    
+    try:
+        # Check if source file exists
+        if not os.path.exists(tmpl_path):
+            st.error(f"Template file not found: {tmpl_path}")
+            return False
+        
+        # Copy template with retry logic
+        max_retries = 3
+        retry_delay = 1
+        
+        if os.path.exists(output_path):
+            try:
+                pythoncom.CoInitialize()
+                try:
+                    excel_app = win32com.client.GetActiveObject("Excel.Application")
+                    abs_out = os.path.abspath(output_path)
+                    for wb_open in excel_app.Workbooks:
+                        if os.path.abspath(wb_open.FullName) == abs_out:
+                            wb_open.Close(SaveChanges=False)
+                            break
+                except Exception: pass
+            except Exception: pass
+
+        for attempt in range(max_retries):
+            try:
+                shutil.copy2(tmpl_path, output_path)
+                break
+            except PermissionError:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    st.error(f"Cannot copy template file after {max_retries} attempts. Please ensure '{os.path.basename(output_path)}' is closed.")
+                    return False
+        
+        # Use Excel COM automation
+        pythoncom.CoInitialize()
+        excel = None
+        wb = None
+        
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            
+            abs_path = os.path.abspath(output_path)
+            # Open with password
+            wb = excel.Workbooks.Open(abs_path, False, False, None, password)
+
+            # Optimization for large datasets (Set after workbook is open)
+            try:
+                excel.ScreenUpdating = False
+                excel.Calculation = -4135  # xlCalculationManual
+            except Exception:
+                pass
+            
+            # Select target sheet
+            try:
+                ws = wb.Sheets("VOLARE EXTRACTION")
+            except Exception:
+                st.error("Sheet 'VOLARE EXTRACTION' not found in the template.")
+                return False
+
+            num_rows = len(df_cleaned)
+            num_cols = len(df_cleaned.columns)
+            
+            # 1. Paste cleaned data starting from A3
+            # Convert dataframe to values
+            data_values = df_cleaned.values.tolist()
+            
+            # Handle timestamps/dates for Excel COM compatibility
+            for r_idx in range(len(data_values)):
+                for c_idx in range(len(data_values[r_idx])):
+                    val = data_values[r_idx][c_idx]
+                    if pd.isna(val):
+                        data_values[r_idx][c_idx] = ""
+                    elif isinstance(val, (pd.Timestamp, datetime)):
+                        data_values[r_idx][c_idx] = val.strftime('%m/%d/%Y')
+
+            st.write(f"Pasting {num_rows} rows into 'VOLARE EXTRACTION' starting at A3...")
+            start_cell = ws.Cells(3, 1)
+            end_cell = ws.Cells(3 + num_rows - 1, num_cols)
+            ws.Range(start_cell, end_cell).Value = data_values
+
+            # 2. Formula Replication (AZ to BL)
+            if num_rows > 0:
+                st.write("Replicating formulas from Row 1 for columns AZ:BL...")
+                last_data_row = 3 + num_rows - 1
+                
+                # Column AZ to BL
+                # AZ in Excel is 52, BL is 64
+                # User specified to replicate from Row 1
+                formula_range_source = ws.Range(ws.Cells(1, 52), ws.Cells(1, 64))
+                formula_range_dest = ws.Range(ws.Cells(3, 52), ws.Cells(last_data_row, 64))
+                
+                # Copy formulas from Row 1 to the rest
+                formula_range_source.Copy()
+                formula_range_dest.PasteSpecial(Paste=-4123) # xlPasteFormulas
+                excel.Application.CutCopyMode = False
+
+                # Force calculation once formulas are in
+                st.write("Calculating formulas...")
+                ws.Calculate()
+
+                # --- TEMPLATE PHASE START ---
+                # This section handles all Excel-specific post-processing logic.
+                st.write("Entering TEMPLATE PHASE...")
+
+                last_row = last_data_row
+                
+                # 1. Bulk Clearing (Memory-based for speed)
+                st.write("Processing columns BF, BG, BH (Clearing)...")
+                try:
+                    # BE=57 (ACTION), BF=58 (REACTION), BG=59 (AMT), BH=60 (WHEN)
+                    vals_be = ws.Range(f"BE3:BE{last_row}").Value
+                    vals_bf = list(ws.Range(f"BF3:BF{last_row}").Value)
+                    vals_bg = list(ws.Range(f"BG3:BG{last_row}").Value)
+                    vals_bh = list(ws.Range(f"BH3:BH{last_row}").Value)
+                    
+                    if not isinstance(vals_be, (list, tuple)): vals_be = [[vals_be]]
+                    vals_bf = [list(r) for r in vals_bf]
+                    vals_bg = [list(r) for r in vals_bg]
+                    vals_bh = [list(r) for r in vals_bh]
+                    
+                    cleared_bf = 0
+                    cleared_bg_bh = 0
+                    
+                    for i in range(len(vals_be)):
+                        be_val = str(vals_be[i][0]).strip().upper() if vals_be[i][0] is not None else ""
+                        bf_val = str(vals_bf[i][0]).strip().upper() if vals_bf[i][0] is not None else ""
+                        
+                        # Clear REACTION (BF) if '0' or '#N/A'
+                        if bf_val in ("0", "0.0", "#N/A") or vals_bf[i][0] == -2146826246:
+                            vals_bf[i][0] = ""
+                            cleared_bf += 1
+                            
+                        # Clear AMT/WHEN (BG/BH) if ACTION is not PTP
+                        if be_val != "PTP" and be_val != "":
+                            vals_bg[i][0] = ""
+                            vals_bh[i][0] = ""
+                            cleared_bg_bh += 1
+                            
+                    if cleared_bf > 0:
+                        ws.Range(f"BF3:BF{last_row}").Value = vals_bf
+                        st.write(f"Cleared {cleared_bf} cells in REACTION (BF)")
+                    
+                    if cleared_bg_bh > 0:
+                        ws.Range(f"BG3:BG{last_row}").Value = vals_bg
+                        ws.Range(f"BH3:BH{last_row}").Value = vals_bh
+                        st.write(f"Cleared 'AMT'/'WHEN' for {cleared_bg_bh} rows (Action not PTP)")
+                        
+                except Exception as e:
+                    st.warning(f"Clearing error: {e}")
+
+                # 2. Batch Row Deletion (Identify AZ=#N/A, BE=EXCLUDED, or BG=0)
+                st.write("Identifying rows to delete (Step 3 & Step 4 & BG=0)...")
+                delete_range = None
+                to_delete_count = 0
+
+                # 1. Identify rows to delete from CH CODE (AZ) and ACTION (BE)
+                st.write("Identifying rows to delete (Step 3 & Step 4 EXCLUDED & AMT=0)...")
+                try:
+                    vals_az = ws.Range(f"AZ3:AZ{last_row}").Value
+                    vals_be = ws.Range(f"BE3:BE{last_row}").Value
+                    vals_bg = ws.Range(f"BG3:BG{last_row}").Value
+                    
+                    # Ensure we handle single-row returns (scalar/tuple)
+                    if not isinstance(vals_az, (list, tuple)): vals_az = [[vals_az]]
+                    if not isinstance(vals_be, (list, tuple)): vals_be = [[vals_be]]
+                    if not isinstance(vals_bg, (list, tuple)): vals_bg = [[vals_bg]]
+                    
+                    def is_error_or_na(v):
+                        """Checks if a value is an Excel #N/A error or string '#N/A'"""
+                        if v == -2146826246: return True
+                        v_str = str(v).strip().upper() if v is not None else ""
+                        return v_str == "#N/A"
+
+                    def is_zero_amount(v):
+                        """Checks if a value is effectively zero, but not empty/None"""
+                        if v is None or v == "": return False
+                        try:
+                            return float(v) == 0
+                        except (ValueError, TypeError):
+                            v_str = str(v).strip()
+                            return v_str in ("0", "0.0")
+
+                    for i in range(len(vals_az)):
+                        az_val = vals_az[i][0]
+                        be_val = vals_be[i][0]
+                        bg_val = vals_bg[i][0]
+                        
+                        # BE string for specific matches
+                        be_str = str(be_val).strip().upper() if be_val is not None else ""
+                        az_str = str(az_val).strip() if az_val is not None else ""
+                        
+                        # Criteria 1: CH CODE (AZ) is #N/A or blank
+                        match_az = is_error_or_na(az_val) or az_str == ""
+                        
+                        # Criteria 2: ACTION (BE) is EXCLUDED or #N/A
+                        match_be_excluded = is_error_or_na(be_val) or be_str in ("EXCLUDED", "EXLUDED")
+                        
+                        # Criteria 3: AMT (BG) is 0 (Actual 0, not cleared blank)
+                        match_bg_zero = is_zero_amount(bg_val)
+                        
+                        # Criteria 4: ACTION (BE) is exactly "PTP"
+                        match_be_ptp = (be_str == "PTP")
+                        
+                        if (match_az or match_be_excluded or match_bg_zero or match_be_ptp) and be_str != "":
+                            curr_row = ws.Rows(3 + i)
+                            if delete_range is None:
+                                delete_range = curr_row
+                            else:
+                                delete_range = excel.Union(delete_range, curr_row)
+                            to_delete_count += 1
+                    
+                    if delete_range:
+                        st.write(f"Deleting {to_delete_count} rows in batch...")
+                        delete_range.Delete()
+                except Exception as e:
+                    st.warning(f"Deletion logic error: {e}")
+
+                # 2. Clear AMT/WHEN for remaining rows where Action != PTP
+                st.write("Clearing AMT/WHEN for non-PTP rows...")
+                try:
+                    last_row = ws.Cells(ws.Rows.Count, "A").End(-4162).Row
+                    if last_row >= 3:
+                        vals_be = ws.Range(f"BE3:BE{last_row}").Value
+                        vals_bg = list(ws.Range(f"BG3:BG{last_row}").Value)
+                        vals_bh = list(ws.Range(f"BH3:BH{last_row}").Value)
+                        
+                        # Convert tuples to lists for mutability
+                        vals_bg = [list(r) for r in vals_bg]
+                        vals_bh = [list(r) for r in vals_bh]
+                        
+                        cleared_count = 0
+                        for i, row_val in enumerate(vals_be):
+                            val = row_val[0]
+                            val_str = str(val).strip().upper() if val is not None else ""
+                            # If it's not a PTP variant (starts with PTP), clear the cells.
+                            # This now includes blank actions (val_str == "") as requested.
+                            if not val_str.startswith("PTP"):
+                                vals_bg[i][0] = ""
+                                vals_bh[i][0] = ""
+                                cleared_count += 1
+                        
+                        if cleared_count > 0:
+                            ws.Range(f"BG3:BG{last_row}").Value = vals_bg
+                            ws.Range(f"BH3:BH{last_row}").Value = vals_bh
+                            st.write(f"Cleared 'AMT'/'WHEN' for {cleared_count} rows in bulk")
+                except Exception as e:
+                    st.warning(f"Step 4 clearing error: {e}")
+
+                # 3. Process 'SYSTEM' in NOTES 1 (BC)
+                st.write("Updating 'Remark By' for SYSTEM notes...")
+                try:
+                    last_row = ws.Cells(ws.Rows.Count, "A").End(-4162).Row
+                    if last_row >= 3:
+                        # L=12 (Remark By), O=15 (Collector), BC=55 (NOTES 1)
+                        vals_l = ws.Range(f"L3:L{last_row}").Value
+                        vals_o = ws.Range(f"O3:O{last_row}").Value
+                        vals_bc = ws.Range(f"BC3:BC{last_row}").Value
+                        
+                        # Ensure we handle single-row returns
+                        if not isinstance(vals_l, (list, tuple)): vals_l = [[vals_l]]
+                        if not isinstance(vals_o, (list, tuple)): vals_o = [[vals_o]]
+                        if not isinstance(vals_bc, (list, tuple)): vals_bc = [[vals_bc]]
+                        
+                        # Convert to mutable list of lists
+                        vals_l = [list(r) for r in vals_l]
+                        
+                        updated_count = 0
+                        for i in range(len(vals_bc)):
+                            bc_val = str(vals_bc[i][0]).upper() if vals_bc[i][0] is not None else ""
+                            if "SYSTEM" in bc_val:
+                                collector_val = vals_o[i][0]
+                                vals_l[i][0] = collector_val
+                                updated_count += 1
+                        
+                        if updated_count > 0:
+                            ws.Range(f"L3:L{last_row}").Value = vals_l
+                            st.write(f"Updated {updated_count} rows where NOTES 1 was 'SYSTEM'")
+                            # Force calculate to update formulas before baking
+                            ws.Calculate()
+                except Exception as e:
+                    st.warning(f"SYSTEM update error: {e}")
+
+                # 4. Truncate 'NOTES 2' (BD) to 250 characters and calculate length in BM
+                st.write("Truncating 'NOTES 2' and calculating character count in BM...")
+                try:
+                    # Set Header in BM2
+                    ws.Range("BM2").Value = "LENGTH"
+                    
+                    last_row = ws.Cells(ws.Rows.Count, "A").End(-4162).Row
+                    if last_row >= 3:
+                        # BD=56 (NOTES 2), BM=65 (LENGTH)
+                        vals_bd = ws.Range(f"BD3:BD{last_row}").Value
+                        vals_bm = ws.Range(f"BM3:BM{last_row}").Value
+                        
+                        if not isinstance(vals_bd, (list, tuple)): vals_bd = [[vals_bd]]
+                        if not isinstance(vals_bm, (list, tuple)): vals_bm = [[vals_bm]]
+                        
+                        vals_bd_list = [list(r) for r in vals_bd]
+                        vals_bm_list = [list(r) for r in vals_bm]
+                        
+                        truncated_count = 0
+                        for i in range(len(vals_bd_list)):
+                            val = vals_bd_list[i][0]
+                            if val is not None:
+                                val_str = str(val)
+                                if len(val_str) > 250:
+                                    val_str = val_str[:250]
+                                    vals_bd_list[i][0] = val_str
+                                    truncated_count += 1
+                                # Update BM with the length of the (possibly truncated) text
+                                vals_bm_list[i][0] = len(val_str)
+                            else:
+                                vals_bm_list[i][0] = 0
+                        
+                        # Write both columns back
+                        ws.Range(f"BM3:BM{last_row}").Value = vals_bm_list
+                        if truncated_count > 0:
+                            ws.Range(f"BD3:BD{last_row}").Value = vals_bd_list
+                            st.write(f"Truncated {truncated_count} rows in 'NOTES 2' and updated character counts in BM")
+                        else:
+                            st.write("Updated character counts in BM")
+                except Exception as e:
+                    st.warning(f"NOTES 2 truncation/count error: {e}")
+
+                # --- TEMPLATE PHASE END ---
+
+                # --- FINAL BAKING (Last part before saving) ---
+                st.write("Baking final formulas into values...")
+                last_row_final = ws.Cells(ws.Rows.Count, "A").End(-4162).Row
+                if last_row_final >= 3:
+                    try:
+                        final_range = ws.Range(f"AZ3:BM{last_row_final}")
+                        final_range.Copy()
+                        final_range.PasteSpecial(Paste=-4163) # xlPasteValues
+                        excel.Application.CutCopyMode = False
+                    except Exception as e:
+                        st.warning(f"Final baking error: {e}")
+
+            # Select A1 to unselect the range before saving
+            try:
+                ws.Range("A1").Select()
+            except Exception:
+                pass
+            
+            # Save and close
+            wb.Save()
+            wb.Close(False)
+            return True
+            
+        except Exception as e:
+            st.error(f"Error in Excel processing: {e}")
+            return False
+        finally:
+            if excel:
+                excel.Quit()
+            pythoncom.CoUninitialize()
+            
+    except Exception as e:
+        st.error(f"Error in process_template: {e}")
+        return False
+
+def main():
+    st.title(" ProdE Efforts Automation")
+    st.markdown("Automated cleaning, template integration, and multi-campaign bucket reporting.")
+
+    # --- SIDEBAR CONFIGURATION ---
+    st.sidebar.header("Configuration")
+    months = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]
+    selected_month = st.sidebar.selectbox("Select Reporting Month", months, index=datetime.now().month - 1)
+    
+    weeks = ["WEEK 1", "WEEK 2", "WEEK 3", "WEEK 4", "WEEK 5"]
+    selected_week = st.sidebar.selectbox("Select Target Week", weeks)
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Template Security")
+    bucket_password = st.sidebar.text_input("Bucket Template Password", type="password", help="Enter password for campaign templates")
+    
+    st.sidebar.divider()
+    st.sidebar.info(f"**Target Folder:**\n`{os.path.join(AUTOMATED_PATH, f'{selected_month} {selected_week}')}`")
+
+    # --- UPLOAD SECTION ---
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("1. Raw Data")
+        uploaded_file = st.file_uploader("Upload Raw ProdE File (Excel or CSV)", type=["xlsx", "xls", "csv"])
+
+    with col2:
+        st.subheader("2. Bucket Templates")
+        bucket_templates = st.file_uploader("Upload Campaign Templates (120, 150, 180)", type=["xlsx", "xlsm", "xlsb"], accept_multiple_files=True)
+        
+        if bucket_templates:
+            st.markdown("### Template Detection")
+            validations = []
+            for bt in bucket_templates:
+                name = bt.name.upper()
+                has_month = selected_month in name
+                has_week = selected_week in name
+                campaign = "NONE"
+                if "120" in name: campaign = "120"
+                elif "150" in name: campaign = "150"
+                elif "180" in name: campaign = "180"
+                
+                # Internal check (Sheet & A2) - Decrypt if password-protected
+                sheet_exists = False
+                is_empty = "Unknown"
+                try:
+                    if not bucket_password:
+                        is_empty = "Insert Password"
+                        raise ValueError("Password required")
+                        
+                    bt_content = bt.getvalue()
+                    readable_content = BytesIO(bt_content)
+                    
+                    # Decrypt password-protected file
+                    try:
+                        encrypted = BytesIO(bt_content)
+                        decrypted = BytesIO()
+                        office_file = msoffcrypto.OfficeFile(encrypted)
+                        office_file.load_key(password=bucket_password)
+                        office_file.decrypt(decrypted)
+                        readable_content = decrypted
+                    except Exception:
+                        is_empty = "❌ Wrong Password"
+                        raise ValueError("Decryption failed")
+                    
+                    with pd.ExcelFile(readable_content, engine='openpyxl') as xls:
+                        sheet_names = xls.sheet_names
+                        # Fuzzy matching: case-insensitive, strip spaces
+                        target_normalized = selected_week.strip().upper()
+                        found_sheet = next((s for s in sheet_names if s.strip().upper() == target_normalized), None)
+                        
+                        sheet_exists = found_sheet is not None
+                        if sheet_exists:
+                            # Skip the header row (Row 1) and check if Row 2+ has data
+                            df_check = pd.read_excel(xls, sheet_name=found_sheet, skiprows=1, nrows=1, header=None)
+                            if not df_check.empty and len(df_check) > 0 and not df_check.iloc[0].isna().all():
+                                is_empty = "❌"
+                            else:
+                                is_empty = "✅"
+                        else:
+                            is_empty = f"N/A ({', '.join(sheet_names[:3])})"
+                except ValueError:
+                    pass # Handled above
+                except Exception as e:
+                    is_empty = f"Error: {str(e)[:30]}"
+                
+                # A file is valid if filename matches month, campaign is detected, sheet exists, and it's EMPTY
+                status = "✅" if (has_month and campaign != "NONE" and sheet_exists and "✅" in is_empty) else "❌"
+                validations.append({
+                    "File": bt.name, 
+                    "Campaign": campaign, 
+                    "Week Sheet": "Found" if sheet_exists else "Missing",
+                    "A2 Status": is_empty,
+                    "Status": status
+                })
+            
+            st.table(validations)
+
+    if uploaded_file:
+        file_ext = uploaded_file.name.split('.')[-1]
+        
+        with st.spinner("Reading data..."):
+            try:
+                if file_ext == 'csv':
+                    df = pd.read_csv(uploaded_file)
+                else:
+                    df = pd.read_excel(uploaded_file)
+                
+                df.columns = df.columns.str.strip()
+            except Exception as e:
+                st.error(f"Error loading file: {e}")
+                st.stop()
+
+        # --- PHASE 1: DATA CLEANING ---
+        st.subheader(" Phase 1: Cleaning Data")
+        
+        orig_count = len(df)
+        
+        # 1. Filter Status: Remove rows with "BP"
+        if 'Status' in df.columns:
+            df = df[df['Status'].astype(str) != 'BP']
+        
+        # 2. Filter Remark By: Remove specific names
+        if 'Remark By' in df.columns:
+            excluded_remark_by = ["DCCAUNTE", "CMENRIQUEZ", "EDSUMAIT", "JSCANA", "NRPARAYAOAN"]
+            mask = ~df['Remark By'].astype(str).str.upper().isin([name.upper() for name in excluded_remark_by])
+            df = df[mask]
+        
+        # 3. Account No. formatting (LAN)
+        target_col = "Account No."
+        if target_col in df.columns:
+            df[target_col] = df[target_col].astype(str).str.replace(r'\.0$', '', regex=True)
+            df[target_col] = df[target_col].replace(['nan', 'None'], '')
+            df = df[df[target_col] != ""]
+            df[target_col] = "'000000" + df[target_col]
+        
+        # 4. Date formatting (MM/DD/YYYY)
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%m/%d/%Y')
+        
+        # 4. Remark cleaning
+        col_remark = "Remark"
+        if col_remark in df.columns:
+            df[col_remark] = df[col_remark].apply(lambda x: str(x)[1:] if str(x).startswith('=') else x)
+        
+        # 5. Remove last 2 columns
+        if len(df.columns) > 2:
+            df = df.iloc[:, :-2]
+            
+        # 6. Move "Next Call"
+        found_col = None
+        for col in df.columns:
+            if 'next' in str(col).lower() and 'call' in str(col).lower():
+                found_col = col
+                break
+        
+        if found_col:
+            col_data = df.pop(found_col)
+            actual_target = min(23, len(df.columns))
+            df.insert(actual_target, found_col, col_data)
+        
+        cleaned_count = len(df)
+        st.success(f"Cleaned! Rows: {orig_count} → {cleaned_count}")
+
+        st.divider()
+        
+        # --- EXPORT SECTION ---
+        st.subheader(" Phase 2 & 3: Automation")
+        
+        filename = f"ProdE_Automated_{datetime.now().strftime('%Y%m%d')}.xlsm"
+        full_save_path = os.path.join(SAVE_PATH, filename)
+        
+        if st.button("START AUTOMATION", type="primary", use_container_width=True):
+            if not WIN32COM_AVAILABLE:
+                st.error("Excel COM (pywin32) is not available on this system.")
+            else:
+                try:
+                    # 1. PROCESS STANDARD TEMPLATE (PHASE 2)
+                    with st.spinner("Processing Standard Template..."):
+                        success = process_template(df, TEMPLATE_PATH, full_save_path, bucket_password)
+                    
+                    if success:
+                        st.success(f"Phase 2 Complete: {filename}")
+                        
+                        # 2. PROCESS BUCKET REPORTS (PHASE 3)
+                        st.info("Phase 3 (Bucket Reports) is currently disabled to focus on the Master report.")
+                        if False: # bucket_templates:
+                            with st.spinner("Processing Bucket Reports..."):
+                                # Create subfolder
+                                bucket_folder = os.path.join(AUTOMATED_PATH, f"{selected_month} {selected_week}")
+                                os.makedirs(bucket_folder, exist_ok=True)
+                                
+                                # Copy Master file to the bucket folder for easy access
+                                master_copy_name = f"MASTER_REPORT_{filename}"
+                                master_copy_path = os.path.join(bucket_folder, master_copy_name)
+                                try:
+                                    shutil.copy2(full_save_path, master_copy_path)
+                                    st.write(f"Master Report copied to: `{selected_month} {selected_week}`")
+                                except Exception:
+                                    pass
+                                
+                                import win32com.client
+                                import pythoncom
+                                pythoncom.CoInitialize()
+                                excel = win32com.client.DispatchEx("Excel.Application")
+                                excel.Visible = False
+                                excel.DisplayAlerts = False
+                                
+                                try:
+                                    # Open the processed master to read the Template Phase columns (BA:BM)
+                                    wb_source = excel.Workbooks.Open(os.path.abspath(full_save_path))
+                                    ws_source = wb_source.Sheets("VOLARE EXTRACTION")
+                                    last_row_src = ws_source.Cells(ws_source.Rows.Count, "A").End(-4162).Row
+                                    
+                                    # Read BA:BM (Indices 53 to 65) + BJ (62) for splitting
+                                    # BA=LAN, BB=DATE, BC=NOTES1, BD=NOTES2, BE=ACTION, BF=REACTION, BG=AMT, BH=WHEN, BI=REF, BJ=PLACEMENT, BK=ENDO, BL=STATUS, BM=LENGTH
+                                    source_data = ws_source.Range(f"BA3:BM{last_row_src}").Value
+                                    wb_source.Close(False)
+                                    
+                                    if source_data is None:
+                                        source_data = []
+                                    elif not isinstance(source_data, (list, tuple)):
+                                        # Single cell
+                                        source_data = ((source_data,),)
+                                    elif len(source_data) > 0 and not isinstance(source_data[0], (list, tuple)):
+                                        # Single row (1D tuple) -> make it 2D
+                                        source_data = (source_data,)
+                                    
+                                    # --- CAMPAIGN SUMMARY LOG ---
+                                    campaign_counts = {"120": 0, "150": 0, "180": 0}
+                                    for row in source_data:
+                                        lan = str(row[0]).strip().replace("'","")
+                                        placement = str(row[9]).strip().upper() if row[9] is not None else ""
+                                        action = str(row[4]).strip().upper() if row[4] is not None else ""
+                                        
+                                        # Skip rows where Action is exactly "PTP" and blank/invalid LAN
+                                        if action == "PTP" or lan in ("", "000000", "NAN", "NONE"):
+                                            continue
+                                            
+                                        if "150" in placement:
+                                            campaign_counts["150"] += 1
+                                        elif "180" in placement:
+                                            campaign_counts["180"] += 1
+                                        elif "MADPL1" in placement or (placement not in ("", "NONE", "NAN") and "1" in placement):
+                                            campaign_counts["120"] += 1
+                                    
+                                    st.write("**Campaign Row Summary:**")
+                                    cols = st.columns(3)
+                                    cols[0].metric("PL120 Rows", campaign_counts["120"])
+                                    cols[1].metric("PL150 Rows", campaign_counts["150"])
+                                    cols[2].metric("PL180 Rows", campaign_counts["180"])
+                                    
+                                    processed_buckets = 0
+                                    for bt in bucket_templates:
+                                        # Identify campaign from filename
+                                        camp = "NONE"
+                                        if "120" in bt.name: camp = "120"
+                                        elif "150" in bt.name: camp = "150"
+                                        elif "180" in bt.name: camp = "180"
+                                        
+                                        if camp == "NONE": continue
+                                        
+                                        # Filter data for this campaign (Check column BJ which is index 9 in our BA:BM range)
+                                        # Index mapping in BA:BM tuple: 0=BA, 1=BB, 2=BC, 3=BD, 4=BE, 5=BF, 6=BG, 7=BH, 8=BI, 9=BJ, 10=BK, 11=BL, 12=BM
+                                        filtered_rows = []
+                                        for row in source_data:
+                                            lan = str(row[0]).strip().replace("'","")
+                                            placement = str(row[9]).strip().upper() if row[9] is not None else ""
+                                            action = str(row[4]).strip().upper() if row[4] is not None else ""
+                                            
+                                            # Skip rows where Action is exactly "PTP" and blank/invalid LAN
+                                            if action == "PTP" or lan in ("", "000000", "NAN", "NONE"):
+                                                continue
+                                                
+                                            is_match = False
+                                            if camp == "120":
+                                                # Match if it says MADPL1 or doesn't have 150/180, excluding blank/none/nan
+                                                if "MADPL1" in placement or ("150" not in placement and "180" not in placement and placement not in ("", "NONE", "NAN")):
+                                                    is_match = True
+                                            elif camp in placement:
+                                                is_match = True
+                                                
+                                            if is_match:
+                                                # Map to the 12-column Bucket schema
+                                                # 1.LAN, 2.DATE, 3.NOTES1, 4.NOTES2, 5.ACTION, 6.REACTION, 7.AMT, 8.WHEN, 9.BLANK, 10.STATUS, 11.BLANK, 12.LENGTH
+                                                # Ensure LAN padding and Date formatting carry over
+                                                def format_excel_date(val):
+                                                    if val is None or val == "": return ""
+                                                    if isinstance(val, datetime):
+                                                        return val.strftime('%m/%d/%Y')
+                                                    
+                                                    val_str = str(val).strip()
+                                                    # Try parsing float (Excel Serial)
+                                                    try:
+                                                        from datetime import date, timedelta
+                                                        excel_date = date(1899, 12, 30) + timedelta(days=float(val))
+                                                        return excel_date.strftime('%m/%d/%Y')
+                                                    except:
+                                                        pass
+
+                                                    # Try parsing DD/MM/YYYY strings
+                                                    try:
+                                                        parts = val_str.replace("-","/").split("/")
+                                                        if len(parts) == 3:
+                                                            # If first part > 12, it must be DD/MM/YYYY
+                                                            if int(parts[0]) > 12:
+                                                                return f"{parts[1].zfill(2)}/{parts[0].zfill(2)}/{parts[2]}"
+                                                            # If it's already in some order, try to standardize it
+                                                            # (This part is tricky, but let's assume if it's text, it's likely DD/MM/YYYY given user's locale)
+                                                            return f"{parts[1].zfill(2)}/{parts[0].zfill(2)}/{parts[2]}"
+                                                    except:
+                                                        pass
+                                                        
+                                                    return val_str
+
+                                                lan_val = str(row[0]).strip().replace("'","")
+                                                # Ensure it has exactly one '000000 prefix
+                                                if not lan_val.startswith("000000"):
+                                                    lan_val = "000000" + lan_val
+                                                lan_val = "'" + lan_val
+
+                                                # Only keep AMT and WHEN if the action is a PTP-type (starts with PTP)
+                                                action_str = str(row[4]).strip().upper() if row[4] is not None else ""
+                                                amt_val = row[6] if action_str.startswith("PTP") else ""
+                                                when_val = format_excel_date(row[7]) if action_str.startswith("PTP") else ""
+
+                                                mapped_row = [
+                                                    lan_val,                      # 1. LAN (A)
+                                                    format_excel_date(row[1]),    # 2. DATE (B)
+                                                    row[2],                       # 3. NOTES 1 (C)
+                                                    row[3],                       # 4. NOTES 2 (D)
+                                                    row[4],                       # 5. ACTION (E)
+                                                    row[5],                       # 6. REACTION (F)
+                                                    amt_val,                      # 7. AMT (G)
+                                                    when_val,                     # 8. WHEN (H)
+                                                    row[8],                       # 9. REF CODE (I)
+                                                    row[11],                      # 10. STATUS (J)
+                                                    format_excel_date(row[10]),   # 11. ENDO DATE (K)
+                                                    row[12]                       # 12. OF CHARACTERS (L)
+                                                ]
+                                                filtered_rows.append(mapped_row)
+                                        
+                                        if not filtered_rows:
+                                            st.info(f"No data found for Campaign {camp}")
+                                            continue
+
+                                        # Save template to temp path with correct suffix
+                                        suffix = os.path.splitext(bt.name)[1]
+                                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                                            tmp.write(bt.getvalue())
+                                            tmp_path = tmp.name
+                                        
+                                        # Open Bucket Template with Password
+                                        try:
+                                            wb_bt = excel.Workbooks.Open(os.path.abspath(tmp_path), False, False, None, bucket_password)
+                                        except Exception as e:
+                                            st.error(f"Failed to open {bt.name} with password. Error: {e}")
+                                            continue
+                                        # Fuzzy sheet selection
+                                        sheet_names_bt = [s.Name for s in wb_bt.Sheets]
+                                        target_norm = selected_week.strip().upper()
+                                        found_s_name = next((s for s in sheet_names_bt if s.strip().upper() == target_norm), None)
+                                        
+                                        if not found_s_name:
+                                            st.error(f"Sheet matching '{selected_week}' not found in {bt.name}. Sheets found: {', '.join(sheet_names_bt)}")
+                                            wb_bt.Close(False)
+                                            continue
+                                            
+                                        ws_bt = wb_bt.Sheets(found_s_name)
+                                        
+                                        # Recognition: Clear A2 downwards if data exists
+                                        if ws_bt.Range("A2").Value is not None:
+                                            st.write(f"Recognized existing data in {bt.name} ({selected_week}). Clearing for refresh...")
+                                            last_row_bt = ws_bt.Cells(ws_bt.Rows.Count, "A").End(-4162).Row
+                                            if last_row_bt >= 2:
+                                                ws_bt.Range(f"A2:L{last_row_bt}").ClearContents()
+                                        
+                                        # Paste Data
+                                        num_r = len(filtered_rows)
+                                        dest_range = ws_bt.Range(ws_bt.Cells(2, 1), ws_bt.Cells(2 + num_r - 1, 12))
+                                        dest_range.Value = filtered_rows
+                                        
+                                        # Save final
+                                        final_name = f"UPDATED PRODUCTIVITY REPORT {selected_month} {selected_week} PL{camp}{os.path.splitext(bt.name)[1]}"
+                                        final_path = os.path.join(bucket_folder, final_name)
+                                        wb_bt.SaveAs(os.path.abspath(final_path))
+                                        wb_bt.Close()
+                                        processed_buckets += 1
+                                    
+                                    if processed_buckets > 0:
+                                        st.balloons()
+                                        st.success(f"Phase 3 Complete: Created {processed_buckets} reports in `{bucket_folder}`")
+                                    
+                                finally:
+                                    excel.Quit()
+                                    pythoncom.CoUninitialize()
+                        else:
+                            st.info("No bucket templates uploaded. Skipping Phase 3.")
+                            st.balloons()
+                except Exception as e:
+                    st.error(f"Automation Error: {e}")
+
+if __name__ == "__main__":
+    main()
